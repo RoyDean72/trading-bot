@@ -1,10 +1,3 @@
-pip install pydantic aiohttp
-
-APCA_API_KEY_ID=your_key
-APCA_API_SECRET_KEY=your_secret
-DATA_SOURCES=https://financial-data.example.com/stocks,https://market-data.example.com/indicators
-POSITION_SIZE_PCT=2.0
-
 """
 Advanced Value Investing Trading Bot with Risk Management
 """
@@ -13,6 +6,7 @@ import os
 import sys
 import concurrent.futures
 import logging
+import logging.handlers
 import asyncio
 from time import time
 from typing import List, Dict, Optional, Tuple
@@ -24,7 +18,8 @@ import requests
 import alpaca_trade_api as tradeapi
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from pydantic import BaseSettings, Field, PositiveFloat, PositiveInt
+from pydantic_settings import BaseSettings
+from pydantic import Field, PositiveFloat, PositiveInt
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -49,13 +44,7 @@ class Settings(BaseSettings):
     APCA_API_KEY_ID: str = Field(..., env="APCA_API_KEY_ID")
     APCA_API_SECRET_KEY: str = Field(..., env="APCA_API_SECRET_KEY")
     APCA_API_BASE_URL: str = Field("https://paper-api.alpaca.markets", env="APCA_API_BASE_URL")
-    DATA_SOURCES: List[str] = Field(
-        [
-            "https://financial-data.example.com/stocks",
-            "https://market-data.example.com/indicators",
-        ],
-        env="DATA_SOURCES",
-    )
+    DATA_SOURCES: List[str] = Field([], env="DATA_SOURCES")
     MAX_WORKERS: PositiveInt = 5
     REQUEST_TIMEOUT: PositiveFloat = 15.0
     POSITION_SIZE_PCT: PositiveFloat = Field(2.0, gt=0.0, le=100.0)
@@ -89,10 +78,9 @@ class AlpacaAPIClient:
             key_id=settings.APCA_API_KEY_ID,
             secret_key=settings.APCA_API_SECRET_KEY,
             base_url=settings.APCA_API_BASE_URL,
-            api_version="v2",
-            retries=3,
-            backoff_factor=2,
+            api_version="v2"
         )
+        self.failure_count = 0
         self.circuit_open = False
         self.last_failure_time = None
         self.failure_threshold = 3
@@ -221,40 +209,41 @@ async def load_sp500_companies(file_path: str = "sp500.csv") -> List[str]:
         return []
 
 
-def enhance_fundamental_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Enhance financial data with derived metrics"""
-    required_columns = {
-        "P/E", "P/B", "EPS", "Market Cap", "Debt/Equity",
-        "Revenue Growth", "ROE", "Current Ratio"
-    }
+def filter_stocks(symbols: List[str], api_client: AlpacaAPIClient) -> pd.DataFrame:
+    """Filter stocks using real Alpaca data"""
+    logger.info(f"Filtering {len(symbols)} symbols...")
+    results = []
+    for symbol in symbols[:3]:  # Test with first 3
+        logger.info(f"Checking {symbol}...")
+        try:
+            from datetime import datetime, timedelta
+            end = datetime.now()
+            start = end - timedelta(days=60)
+            bars = api_client.execute_safe(
+                api_client.api.get_bars,
+                symbol,
+                "1Day",
+                start=start.strftime('%Y-%m-%d'),
+                end=end.strftime('%Y-%m-%d')
+            ).df
+            
+            if bars is not None and len(bars) >= 20:
+                closes = bars['close'].values
+                current = closes[-1]
+                sma20 = np.mean(closes[-20:])
+                
+                logger.info(f"{symbol}: Price=${current:.2f}, SMA20=${sma20:.2f}")
+                
+                # Very simple filter - just above SMA20
+                if current > sma20 * 0.98:  # Within 2% of SMA20
+                    results.append({"Symbol": symbol, "Price": current})
+                    logger.info(f"  ✓ {symbol} PASSED filter")
+                else:
+                    logger.info(f"  ✗ {symbol} below SMA20")
+        except Exception as e:
+            logger.warning(f"Skipping {symbol}: {e}")
     
-    if df.empty or not required_columns.issubset(df.columns):
-        logger.error("Invalid data for enhancement")
-        return df
-
-    try:
-        # Calculate advanced valuation metrics
-        df["EV/EBITDA"] = df["Enterprise Value"] / df["EBITDA"]
-        df["PEG Ratio"] = df["P/E"] / df["EPS Growth"]
-        df["Altman Z-Score"] = (
-            1.2 * (df["Working Capital"] / df["Total Assets"]) +
-            1.4 * (df["Retained Earnings"] / df["Total Assets"]) +
-            3.3 * (df["EBIT"] / df["Total Assets"]) +
-            0.6 * (df["Market Cap"] / df["Total Liabilities"]) +
-            1.0 * (df["Sales"] / df["Total Assets"])
-        )
-
-        # Add quality scores
-        df["Quality Score"] = (
-            0.4 * df["ROE"].rank(pct=True) +
-            0.3 * df["Current Ratio"].rank(pct=True) +
-            0.3 * df["Debt/Equity"].rank(ascending=False, pct=True)
-        )
-
-        return df
-    except KeyError as e:
-        logger.error(f"Missing column for enhancement: {str(e)}")
-        return df
+    return pd.DataFrame(results)
 
 
 async def execute_trades(filtered_stocks: pd.DataFrame, pm: PortfolioManager) -> None:
@@ -344,14 +333,10 @@ async def main():
             logger.error("Aborting due to missing symbols")
             return
 
-        # Concurrent data fetching
-        tasks = [fetcher.fetch(url) for url in settings.DATA_SOURCES]
-        results = await asyncio.gather(*tasks)
-        df = pd.concat([pd.DataFrame(r) for r in results if r], ignore_index=True)
-
-        # Data enhancement and filtering
-        enhanced_df = enhance_fundamental_data(df)
-        filtered_df = filter_stocks(enhanced_df)  # Assume filter_stocks is implemented
+        # Filter stocks using real data
+        logger.info(f"Starting filter with {len(symbols)} symbols")
+        filtered_df = filter_stocks(symbols, api_client)
+        logger.info(f"Filter returned {len(filtered_df)} stocks")
 
         # Execute trades
         await execute_trades(filtered_df, pm)
